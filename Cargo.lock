@@ -503,6 +503,7 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 [[package]]
 name = "rice_coder"
 version = "0.1.0"
+source = "git+https://github.com/PSeitz/rice_coder#c4bbf7496a0ea5fe2a440da6d72f7a1a95118fcc"
 
 [[package]]
 name = "roaring"
