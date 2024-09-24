@@ -12,6 +12,8 @@ tantivy-common = "0.7.0"
 
 [dev-dependencies]
 binggan = "0.10.0"
+pretty_assertions = "1.4.1"
+proptest = "1.5.0"
 rand = "0.8.5"
 zipf = "7.0.1"
 

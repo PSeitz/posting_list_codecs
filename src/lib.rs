@@ -66,6 +66,7 @@ where
         let (first, chunk) = chunk.split_at(1);
         //let k = estimate_optimal_k(chunk, 100.0);
         writer.write_all(&[k])?;
+        writer.write_all(&[chunk.len() as u8])?;
         writer.write_all(&first[0].to_be_bytes())?;
         let mut coder = RiceCoder::new(k);
         coder.encode_vals(chunk, &mut output);
@@ -87,12 +88,13 @@ where
     let mut docids: Vec<u32> = iter.into_iter().collect();
 
     // Write docids in block of 128
-    let mut output = vec![0; 128];
+    let mut output = Vec::with_capacity(128);
     for chunk in docids.chunks_mut(128) {
         get_delta_docids(chunk);
         let k = estimate_optimal_k(chunk, percentile);
         let (first, chunk) = chunk.split_at(1);
         writer.write_all(&[k])?;
+        writer.write_all(&[chunk.len() as u8])?;
         writer.write_all(&first[0].to_be_bytes())?;
         let mut coder = RiceCoder::new(k);
         coder.encode_vals(chunk, &mut output);
@@ -107,12 +109,16 @@ pub fn decode_rice_encoded_docids(data: &[u8]) -> Vec<u32> {
     let mut input = data;
     while !input.is_empty() {
         let k = input[0];
+        let num_vals = input[1];
         let coder = RiceCoder::new(k);
-        let mut prev = u32::from_be_bytes(input[1..5].try_into().unwrap());
+        let mut prev = u32::from_be_bytes(input[2..6].try_into().unwrap());
         docids.push(prev);
         let mut chunk = Vec::new();
-        input = &input[5..];
-        let num_bytes_read = coder.decode_into(input, &mut chunk);
+        input = &input[6..];
+        //dbg!(num_vals);
+        let num_bytes_read = coder.decode_into(input, &mut chunk, num_vals as u32);
+        assert_eq!(chunk.len(), num_vals as usize);
+
         for docid in chunk {
             prev = docid.wrapping_add(prev);
             docids.push(prev);
@@ -176,18 +182,20 @@ impl<W: Write> DocidListWriterVInt<W> {
     }
 }
 
+/// Will read docids from a buffer that was written with write_docids_from_iter
+///
+/// If a block has less than 128 docids, it will use VInt encoding
+/// otherwise it will use bitpacking
 pub struct DocidListReaderMixed {
     bytes: OwnedBytes,
     current_block: Vec<u32>,
-    block_pos: usize,
 }
 
 impl DocidListReaderMixed {
     pub fn new(bytes: OwnedBytes) -> Self {
         Self {
             bytes,
-            current_block: Vec::new(),
-            block_pos: 0,
+            current_block: Vec::with_capacity(128),
         }
     }
 
@@ -199,38 +207,31 @@ impl DocidListReaderMixed {
         let num_docs = self.bytes[0];
         if num_docs < 128 {
             // Last block with fewer than 128 documents, using VInt
+            self.current_block.clear();
             self.bytes.advance(1);
             let reader = DocidListReaderVInt::new(self.bytes.clone());
-            self.current_block = reader.collect();
+            self.current_block.extend(reader);
             self.bytes.advance(self.bytes.len()); // finish
         } else {
+            self.current_block.resize(num_docs as usize, 0);
             // Block with bitpacking
             let num_bits = self.bytes[1];
             let first_doc: u32 = u32::from_be_bytes(self.bytes[2..6].try_into().unwrap());
-            let mut docids = vec![0; num_docs as usize];
             let bitpacker = BitPacker4x::new();
-            let num_bytes_decompressed =
-                bitpacker.decompress_sorted(first_doc, &self.bytes[6..], &mut docids, num_bits);
-            self.current_block = docids;
+            let num_bytes_decompressed = bitpacker.decompress_sorted(
+                first_doc,
+                &self.bytes[6..],
+                &mut self.current_block,
+                num_bits,
+            );
             self.bytes.advance(num_bytes_decompressed + 6); // Advance after reading
         }
 
-        self.block_pos = 0; // Reset block position for new block
         Some(())
     }
-}
-
-impl Iterator for DocidListReaderMixed {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.block_pos >= self.current_block.len() {
-            // If we are out of docids in the current block, try decoding the next block
-            self.decode_next_block()?;
-        }
-        let docid = self.current_block[self.block_pos];
-        self.block_pos += 1;
-        Some(docid)
+    pub fn get_next_block(&mut self) -> Option<&mut [u32]> {
+        self.decode_next_block()?;
+        Some(&mut self.current_block)
     }
 }
 
@@ -268,10 +269,10 @@ impl Iterator for DocidListReaderVInt {
 // Test function
 #[cfg(test)]
 mod tests {
-    use crate::DocIdValue;
-
     use super::*;
+    use crate::DocIdValue;
     use ownedbytes::OwnedBytes;
+    use proptest::prelude::*;
     use rand::prelude::Distribution;
 
     #[test]
@@ -301,8 +302,11 @@ mod tests {
         write_docids_from_iter(docids.iter().cloned(), &mut buffer).unwrap();
         // Convert buffer to OwnedBytes and read docids using iterator
         let owned_bytes = OwnedBytes::new(buffer);
-        let reader = DocidListReaderMixed::new(owned_bytes);
-        let read_docids: Vec<u32> = reader.collect();
+        let mut reader = DocidListReaderMixed::new(owned_bytes);
+        let mut read_docids: Vec<u32> = Vec::new();
+        while let Some(block) = reader.get_next_block() {
+            read_docids.extend_from_slice(block);
+        }
 
         // Ensure the written docids match the read docids
         assert_eq!(docids, read_docids);
@@ -311,6 +315,45 @@ mod tests {
         write_rice_code_docids_from_iter_detect_k(docids.iter().cloned(), &mut buffer, 80).unwrap();
         let decoded = decode_rice_encoded_docids(&buffer);
         assert_eq!(docids, decoded);
+    }
+
+    proptest! {
+        #[test]
+        fn test_proptest(docids in generate_sorted_deduped_vec() ) {
+            let mut buffer = Vec::new();
+            write_docids_from_iter(docids.iter().cloned(), &mut buffer).unwrap();
+            // Convert buffer to OwnedBytes and read docids using iterator
+            let owned_bytes = OwnedBytes::new(buffer);
+            let mut reader = DocidListReaderMixed::new(owned_bytes);
+            let mut read_docids: Vec<u32> = Vec::new();
+            while let Some(block) = reader.get_next_block() {
+                read_docids.extend_from_slice(block);
+            }
+
+            // Ensure the written docids match the read docids
+            prop_assert_eq!(&docids, &read_docids);
+
+            let mut buffer = Vec::new();
+            write_rice_code_docids_from_iter_detect_k(docids.iter().cloned(), &mut buffer, 80).unwrap();
+            let decoded = decode_rice_encoded_docids(&buffer);
+            prop_assert_eq!(docids, decoded);
+
+        }
+    }
+
+    // Custom strategy for generating sorted and deduplicated vectors
+    fn generate_sorted_deduped_vec() -> impl Strategy<Value = Vec<u32>> {
+        prop::collection::vec(0u32..=500_000, 1..2000).prop_map(|mut vec| {
+            vec.sort();
+            vec.dedup();
+            vec
+        })
+    }
+
+    #[test]
+    fn test_docid_list_iterator_len136() {
+        let docids: Vec<u32> = (0..136).collect();
+        test_docid_list(&docids);
     }
 
     #[test]
